@@ -1,0 +1,550 @@
+ ----------------------------------- auth.controller.js ---------------------------
+
+ import { generateToken } from "../lib/utils.js";
+import User from "../models/user.model.js";
+import bcrypt from "bcryptjs"
+import cloudinary from "../lib/cloudinary.js";
+
+
+
+export const signup = async (req, res) => {
+    const { fullName, email, password } = req.body; 
+    try {
+        if (!fullName || !email || !password) {
+            return res.status(400).json({ message: "All field are required" })
+        }
+
+        if (password.length < 6) {
+            return res.status(400).json({ message: "Password must be at least 6 characters" });
+        }
+
+        const user = await User.findOne({ email })
+
+        if (user) {
+            return res.json(400).json({ message: "Email already exists" });
+        }
+
+        const salt = await bcrypt.genSalt(10)
+        const hashedPassword = await bcrypt.hash(password, salt)
+
+        const newUser = new User({
+            fullName: fullName,
+            email: email,
+            password: hashedPassword
+        })
+
+        if (newUser) {
+            //generate jwt token here
+            generateToken(newUser._id, res)
+            await newUser.save();
+
+            res.status(201).json({
+                _id: newUser._id,
+                fullName: newUser.fullName,
+                email: newUser.email,
+                profilePic: newUser.profilePic,
+            })
+
+        }
+        else {
+            res.status(400).json({ message: "Invalid user data" });
+            res.status(500).json({ message: "Internal Server Error" });
+        }
+
+    }
+    catch (error) {
+        console.log("Error in signup controller", error.message);
+    }
+};
+
+
+
+export const login = async (req, res) => {
+    const { email, password } = req.body
+    try {
+        const user = await User.findOne({ email })
+
+        if (!user) {
+            return res.status(400).json({ message: "Invalid credentials" })
+        }
+
+        const isPasswordCorrect = await bcrypt.compare(password, user.password);
+        if (!isPasswordCorrect) {
+            return res.status(400).json({ message: "Invalid credentials" });
+        }
+
+        generateToken(user._id, res)
+
+        res.status(200).json({
+            _id: user._id,
+            fullName: user.fullName,
+            email: user.email,
+            profilePic: user.profilePic,
+        })
+
+    } catch (error) {
+        console.log("Error in login controller", error.message);
+        res.status(500).json({ message: "Internal Server Error" })
+    }
+
+};
+
+
+
+export const logout = (req, res) => {
+    try {
+        res.cookie("jwt", "", { maxAge: 0 })
+        res.status(200).json({ message: "Logged out successfuly" });
+
+    } catch (error) {
+        console.log("Error in logout controller", error.message);
+        res.status(500).json({ message: "Internal Server Error" });
+    }
+};
+
+
+export const updateProfile = async (req, res) => {
+    try {
+        const { profilePic } = req.body
+        const userId = req.user._id;
+
+        if (!profilePic) {
+            return res.status(400).json({ message: "Profile pic is required" });
+        }
+        const uploadResponse = await cloudinary.uploader.upload(profilePic)
+        const updateUser = await User.findByIdAndUpdate(
+            userId,
+            { profilePic: uploadResponse.secure_url },
+            { new: true }
+        );
+
+        res.status(200).json(updateUser)
+
+    } catch (error) {
+        console.log("error in ypdate profile: ", error);
+        res.status(500).json({ message: "Internal server error" });
+    }
+};
+
+
+export const checkAuth = (req, res) => {
+    try {
+        res.status(200).json(req.user);
+    } catch (error) {
+        console.log("Error in checkAuth controller", error.message);
+        res.status(500).json({ message: "Internal Server Error" });
+    }
+}
+
+
+
+
+----------------------------------------message.controller.js ---------------------
+
+
+
+import User from "../models/user.model.js";
+import Message from "../models/message.model.js";
+
+import cloudinary from "../lib/cloudinary.js";
+import { getReceiverSocketId, io } from "../lib/socket.js";
+
+export const getUsersForSidebar = async (req, res) => {
+  try {
+    const loggedInUserId = req.user._id;
+    const filteredUsers = await User.find({ _id: { $ne: loggedInUserId } }).select("-password");
+
+    res.status(200).json(filteredUsers);
+  } catch (error) {
+    console.error("Error in getUsersForSidebar: ", error.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+export const getMessages = async (req, res) => {
+  try {
+    const { id: userToChatId } = req.params;
+    const myId = req.user._id;
+
+    const messages = await Message.find({
+      $or: [
+        { senderId: myId, receiverId: userToChatId },
+        { senderId: userToChatId, receiverId: myId },
+      ],
+    });
+
+    res.status(200).json(messages);
+  } catch (error) {
+    console.log("Error in getMessages controller: ", error.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+export const sendMessage = async (req, res) => {
+  try {
+    const { text, image } = req.body;
+    const { id: receiverId } = req.params;
+    const senderId = req.user._id;
+
+    let imageUrl;
+    if (image) {
+      // Upload base64 image to cloudinary
+      const uploadResponse = await cloudinary.uploader.upload(image);
+      imageUrl = uploadResponse.secure_url;
+    }
+
+    const newMessage = new Message({
+      senderId,
+      receiverId,
+      text,
+      image: imageUrl,
+    });
+
+    await newMessage.save();
+
+    // todo:  realtime functionality goes here => socket.io
+    const receiverSocketId = getReceiverSocketId(receiverId);
+    if(receiverSocketId){
+      io.to(receiverSocketId).emit("newMessage", newMessage); // we are adding `to` in the middle so that we are only sending this message to the receiver
+    }                                                            // as this is not a group chat this is private chat
+
+
+
+    res.status(201).json(newMessage);
+  } catch (error) {
+    console.log("Error in sendMessage controller: ", error.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+
+
+
+-------------------------------cloudinary---------------------------
+
+
+import {v2 as cloudinary} from "cloudinary"
+
+import {config} from "dotenv";
+
+config();
+
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+export default cloudinary;
+
+
+------------------------------------db.js -----------------------------
+
+import mongoose from "mongoose";
+
+export const connectDB = async()=>{
+    try{
+        const conn = await mongoose.connect(process.env.MONGODB_URI);
+        console.log(`MongoDB connected: ${conn.connection.host}`);
+    }catch(error){
+console.log("MongoDB connection error:", error);
+    }
+}; 
+
+
+
+------------------------- socket.js ---------------------
+
+
+import {Server} from "socket.io"
+import http from "http";
+import express from "express";
+// import cors from "cors";
+import dotenv from "dotenv"
+
+const app = express();
+const server = http.createServer(app);
+dotenv.config()
+
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+
+const io = new Server(server, {
+    cors: {
+        // origin: ["http://localhost:5173"],
+        origin : FRONTEND_URL
+        
+    },
+});
+
+export function getReceiverSocketId(userId){
+    return userSocketMap[userId];
+};
+
+// used to store online users
+const userSocketMap = {};  // {userId: socketId}
+
+io.on("connection", (socket) => {
+    console.log("A user connected", socket.id);
+
+    const userId = socket.handshake.query.userId  //useAuthStore me query me jo id hai wo hai ye
+    if(userId) userSocketMap[userId] = socket.id;
+
+    // io.emit() is used to send events to all the connected clients
+    io.emit("getOnlineUsers", Object.keys(userSocketMap));
+
+
+    socket.on("disconnect", ()=>{
+        console.log("A user disconnected", socket.id);
+        delete userSocketMap[userId];
+        io.emit("getOnlineUsers", Object.keys(userSocketMap));
+    });
+});
+
+export {io, app, server}; 
+
+
+-------------------- utils.js ------------------------------------
+
+import jwt from "jsonwebtoken"
+
+export const generateToken = (userId, res)=>{
+const token = jwt.sign({userId}, process.env.JWT_SECRET,{
+    expiresIn : "7d"
+})
+
+res.cookie("jwt", token, {
+    maxAge: 7 * 24 * 60 * 60 * 1000,  //MS
+    httpOnly: true, //prevent XSS attacks corss-site scripting attack
+    sameSite: "strict", //CSRF attacks cross-site forgery attacks
+    secure: process.env.NODE_ENV !== "development"  // jab tak devvelopment me rahenge ye false rahega
+});
+
+return token;
+} 
+
+//  {userId} is payload of the token
+
+
+---------------------------- auth.middleware.js -------------------------
+
+import jwt from "jsonwebtoken"
+import User from "../models/user.model.js";
+
+export const protectRoute = async (req,res, next)=>{
+    try{
+        const token = req.cookies.jwt;
+
+        if(!token){
+            return res.status(401).json({message: "Unauthorized -No Token Provided"});
+        }
+
+const decoded = jwt.verify(token, process.env.JWT_SECRET)
+
+if(!decoded){
+    return res.status(401).json({message:"Unauthorized - Invalid Token"});
+}
+
+const user = await User.findById(decoded.userId).select("-password");
+
+if(!user){
+    return res.status(404).json({message: "User not found"});
+}
+
+req.user = user
+
+next()
+
+    }catch(error){
+console.log("Error in ProtectRoute middleware: ", error.message);
+    }
+} 
+
+
+
+-------------------------------- message.model.js ---------------------
+
+import mongoose from "mongoose";
+
+const messageSchema = new mongoose.Schema(
+  {
+    senderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    receiverId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    text: {
+      type: String,
+    },
+    image: {
+      type: String,
+    },
+  },
+  { timestamps: true }
+);
+
+const Message = mongoose.model("Message", messageSchema);
+
+export default Message;
+
+
+------------------------------- user.model.js ----------------------
+
+import mongoose from "mongoose";
+
+const userSchema = new mongoose.Schema(
+    {
+        email:{
+            type: String,
+            required:true,
+            unique: true,
+        },
+        fullName: {
+            type: String,
+            required: true,
+        },
+        password:{
+            type: String,
+            required: true,
+            minlength: 6,
+        },
+        profilePic: {
+            type: String,
+            default: "",
+        },
+    },
+    {timestamps: true}
+);
+
+const User = mongoose.model("User", userSchema);
+
+export default User; 
+
+
+
+----------------------------------- auth.route.js --------------------
+
+import express from "express"
+import { checkAuth, login, logout, signup, updateProfile } from "../controllers/auth.controller.js";
+import { protectRoute } from "../middleware/auth.middleware.js";
+
+const router = express.Router();
+
+router.post("/signup", signup);
+router.post("/login", login);
+router.post("/logout", logout);
+
+router.put("/update-profile", protectRoute, updateProfile);
+
+router.get("/check", protectRoute, checkAuth)
+
+export default router; 
+
+
+--------------------------message.route.js -----------------------
+
+import express from "express"
+import {protectRoute} from "../middleware/auth.middleware.js"
+import { getMessages, getUsersForSidebar, sendMessage } from "../controllers/message.controller.js";
+
+const router = express.Router();
+
+router.get("/users", protectRoute, getUsersForSidebar);
+router.get("/:id", protectRoute, getMessages)
+router.post("/send/:id", protectRoute, sendMessage )
+
+export default router;
+
+
+-------------------------------- index.js -------------------------
+
+// const express = require("express")
+import express from "express"
+import authRoutes from "./routes/auth.route.js"
+import dotenv from "dotenv"
+import cookieParser from "cookie-parser"
+import messageRoutes from "./routes/message.route.js"
+import cors from "cors";
+
+import {connectDB} from './lib/db.js'
+import { app, server } from "./lib/socket.js"
+dotenv.config()
+// const app = express();    // delete because soket.io me app create kar diya hai
+// import { app, server } from "./lib/socket.js"  <------ we imported this app from soket.io this will we will use
+
+const PORT = process.env.PORT || 5001;
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+// this will allow you to extract json data out of body
+app.use(express.json()); 
+app.use(cookieParser());
+app.use(cors({ 
+    // origin: "http://localhost:5173",
+    origin: FRONTEND_URL,
+    credentials: true
+}))
+
+
+app.use("/api/auth", authRoutes);
+app.use("/api/messages", messageRoutes);
+
+// app.listen(PORT, ()=>{             <------------- app ko server se replace kar de to use socket.io
+server.listen(PORT, ()=>{
+    console.log("server is running on PORT :" + PORT);
+    console.log(`CORS allowed for: ${FRONTEND_URL}`);
+    connectDB()
+}) 
+
+
+
+------------------------------------- package.json --------------------------
+
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "start" : "node src/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "type": "module",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.5.1",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.9.5",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
+
+
+
+------------------------------vercel.json --------------------------
+
+
+{
+    "version":2,
+    "builds": [
+        {"src": "src/index.js", "use": "@vercel/node"}
+    ],
+    "routes": [
+        {
+            "src": "/(.*)",
+            "dest": "src/index.js"
+        }
+    ]
+}
